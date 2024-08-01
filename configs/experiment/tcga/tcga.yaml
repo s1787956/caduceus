@@ -1,0 +1,58 @@
+# @package _global_
+defaults:
+  - /pipeline: tcga
+  - /model: ???  # Specify a model, e.g. model=mamba or model=hyena
+  - override /scheduler: cosine_warmup_timm
+
+task:
+  _name_: lm
+  loss:
+    _name_: cross_entropy
+    ignore_index: 7
+
+trainer:
+  accelerator: gpu
+  devices: 2
+  num_nodes: 1
+  accumulate_grad_batches: ${div_up:${train.global_batch_size}, ${eval:${trainer.devices} * ${dataset.batch_size} * ${trainer.num_nodes}}}
+  max_epochs: null
+  max_steps: 10000
+  precision: 16  # bf16 only a100
+  gradient_clip_val: 1.0
+  limit_val_batches: 0 #0.125
+  detect_anomaly: true
+
+dataset:
+  batch_size: 1 #${eval:1024//${trainer.devices}}
+  seqs_per_pat: 512 
+  max_length: ${eval:${dataset.seqs_per_pat}*2*60+2*${dataset.seqs_per_pat}+16}  #124944 # (1024*2*60+2*1024+16) # ${eval:${dataset.seqs_per_pat}*2*60+2*${dataset.seqs_per_pat}+16}
+  # optional, default is max_length
+  max_length_val: ${dataset.max_length}
+  max_length_test: ${dataset.max_length}
+  tokenizer_name: char
+  pad_max_length: null  # needed for bpe tokenizer
+  add_eos: true
+  rc_aug: false
+  num_workers: 12
+  use_fixed_len_val: false  # placing a fixed length val here, but it's really the test
+  mlm: true
+  mlm_probability: 0.0
+
+scheduler:
+  t_in_epochs: False
+  t_initial: ${eval:${trainer.max_steps}-${.warmup_t}}
+  warmup_prefix: True
+  warmup_lr_init: 1e-6
+  warmup_t: ${eval:0.1*${trainer.max_steps}}
+  lr_min: 1e-4
+
+optimizer:
+  lr: 6e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+
+train:
+  gpu_mem: ${eval:"round(float(__import__('subprocess').check_output('nvidia-smi -i 0 --query-gpu=memory.total --format=csv,noheader,nounits', shell=True).strip().decode()) / 1000)"}
+  seed: 2222
+  global_batch_size: 256  # effects the scheduler, need to set properly
+  #pretrained_model_path: /mnt/bulk-neptune/timlenz/tumpe/caduceus/outputs/2024-07-21/11-06-28-196644/checkpoints/last.ckpt

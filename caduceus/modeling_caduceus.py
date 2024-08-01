@@ -7,7 +7,9 @@ from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
-from mamba_ssm.modules.mamba_simple import Mamba, Block
+from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.block import Block
 from torch import nn
 from torch.nn import functional as F
 from transformers import PreTrainedModel
@@ -16,8 +18,12 @@ from transformers.modeling_outputs import BaseModelOutputWithNoAttention, Masked
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
-    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
+    #RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+    try:
+        from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
+    except ImportError:
+        RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+    
 from .configuration_caduceus import CaduceusConfig
 from .modeling_rcps import RCPSAddNormWrapper, RCPSEmbedding, RCPSLMHead, RCPSMambaBlock
 
@@ -36,6 +42,7 @@ def create_block(
         rcps=False,
         device=None,
         dtype=None,
+        use_mamba2=True,
 ):
     """Create Caduceus block.
 
@@ -49,7 +56,7 @@ def create_block(
         "bidirectional_strategy": bidirectional_strategy,
         "bidirectional_weight_tie": bidirectional_weight_tie,
     }
-    mixer_cls = partial(BiMambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
+    mixer_cls = partial(BiMambaWrapper,use_mamba2=use_mamba2, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -60,6 +67,7 @@ def create_block(
         norm_cls=norm_cls,
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
+        mlp_cls = nn.Identity,
     )
     block.layer_idx = layer_idx
     return block
@@ -74,6 +82,7 @@ class BiMambaWrapper(nn.Module):
             bidirectional: bool = True,
             bidirectional_strategy: Optional[str] = "add",
             bidirectional_weight_tie: bool = True,
+            use_mamba2 = True,
             **mamba_kwargs,
     ):
         super().__init__()
@@ -83,15 +92,27 @@ class BiMambaWrapper(nn.Module):
             raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
-        self.mamba_fwd = Mamba(
-            d_model=d_model,
-            **mamba_kwargs
-        )
-        if bidirectional:
-            self.mamba_rev = Mamba(
+        if use_mamba2:
+            self.mamba_fwd = Mamba2(
                 d_model=d_model,
                 **mamba_kwargs
             )
+        else:
+            self.mamba_fwd = Mamba(
+                d_model=d_model,
+                **mamba_kwargs
+            )
+        if bidirectional:
+            if use_mamba2:
+                self.mamba_rev = Mamba2(
+                    d_model=d_model,
+                    **mamba_kwargs
+                )
+            else:
+                self.mamba_rev = Mamba(
+                    d_model=d_model,
+                    **mamba_kwargs
+                )
             if bidirectional_weight_tie:  # Tie in and out projections (where most of param count lies)
                 self.mamba_rev.in_proj.weight = self.mamba_fwd.in_proj.weight
                 self.mamba_rev.in_proj.bias = self.mamba_fwd.in_proj.bias
